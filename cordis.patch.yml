@@ -1,0 +1,10 @@
+# dsh-selfup bundle patch: mounts the self-update tools plugin.
+#
+# Applied after the profile's base layer. The row's `name` is this package
+# itself; the loader imports the package entry, which exports the Cordis
+# plugin. The plugin registers four tools on the host `tools` registry, so
+# every session sees dsh_update_status / dsh_update / dsh_install / dsh_systemd.
+
+- insert:
+    - id: dsh-selfup
+      name: 'dsh-selfup'
