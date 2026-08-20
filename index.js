@@ -512,6 +512,15 @@ export function apply(ctx) {
           return { ok: false, summary: `${launcher} missing - run dsh_install mode=local first.`, action, unitPath }
         }
         const nodeDir = node.includes('/') ? node.slice(0, node.lastIndexOf('/')) : ''
+        // Inherit the graphical session's display so the harness's native
+        // directory picker (auto-resolver: DISPLAY/WAYLAND_DISPLAY + zenity)
+        // serves `native` instead of falling back to `browse`, which breaks
+        // host.pickDirectory for workspace creation. Absent display vars
+        // (headless) simply produce no Environment line.
+        const displayR = await runCmd('printf "%s" "$DISPLAY"', { timeoutMs: 15000, policy })
+        const waylandR = await runCmd('printf "%s" "$WAYLAND_DISPLAY"', { timeoutMs: 15000, policy })
+        const display = displayR.exitCode === 0 ? displayR.stdout.text.trim() : ''
+        const wayland = waylandR.exitCode === 0 ? waylandR.stdout.text.trim() : ''
         const unit = [
           '[Unit]',
           'Description=DeepSeek Harness web UI',
@@ -522,6 +531,8 @@ export function apply(ctx) {
           `WorkingDirectory=${repo}`,
           `Environment=DSH_HOME=${home}/.dsh`,
           `Environment=PATH=${nodeDir}:/usr/local/bin:/usr/bin:/bin`,
+          ...(display !== '' ? [`Environment=DISPLAY=${display}`] : []),
+          ...(wayland !== '' ? [`Environment=WAYLAND_DISPLAY=${wayland}`] : []),
           `ExecStart=${launcher} web --host ${host} --port ${port}`,
           'Restart=on-failure',
           'RestartSec=3',
