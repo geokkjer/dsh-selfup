@@ -215,7 +215,7 @@ export function apply(ctx) {
 
   ctx.tools.register(toolDefinition({
     name: 'dsh_update',
-    description: 'Update the DeepSeek Harness checkout: git fetch + fast-forward pull, pnpm install, and a full build (pnpm run build), each as its own step. Refuses a dirty working tree unless force=true (auto-stash before the pull, pop after). Returns per-step exit codes and output tails. The running web session keeps its loaded code until the dsh-web service is restarted (dsh_systemd action=restart).',
+    description: 'Update the DeepSeek Harness checkout: git fetch + fast-forward pull, pnpm install, and a full build (pnpm run build), each as its own step. Refuses a dirty working tree unless force=true (auto-stash before the pull, pop after). Returns per-step exit codes and output tails. A build that fails on stale lib/ artifacts is retried once after pnpm run clean. The running web session keeps its loaded code until the dsh-web service is restarted (dsh_systemd action=restart).',
     parameters: {
       type: 'object',
       properties: {
@@ -324,11 +324,39 @@ export function apply(ctx) {
         }
       }
       if (needBuild) {
-        const proc = startProc('pnpm run build', { workdir: repo, signal, policy })
-        const rep = await waitProc(proc)
-        steps.push({ name: 'pnpm run build', ok: rep.exitCode === 0, exitCode: rep.exitCode, detail: rep.delta.slice(-3000), spillPath: rep.spillPath })
+        const runBuild = async () => {
+          const proc = startProc('pnpm run build', { workdir: repo, signal, policy })
+          return waitProc(proc)
+        }
+        let rep = await runBuild()
+        let note = ''
         if (rep.exitCode !== 0) {
-          return { ok: false, summary: `pnpm run build failed: ${rep.delta.slice(-1000)}`, repo, beforeHead, afterHead, steps }
+          // A pull that renames or removes a package can leave stale `lib/`
+          // bundles referencing removed exports, which breaks the build with
+          // a MISSING_EXPORT error. Wipe build output and retry once; this only
+          // fires on failure, so the common incremental build is untouched.
+          const firstError = rep.delta.trim().slice(-400)
+          const clean = await runCmd('pnpm run clean', { workdir: repo, timeoutMs: 180000, signal, policy })
+          steps.push({
+            name: 'pnpm run clean',
+            ok: clean.exitCode === 0,
+            exitCode: clean.exitCode === null ? -1 : clean.exitCode,
+            detail: shortSummary(clean),
+          })
+          if (clean.exitCode === 0) {
+            rep = await runBuild()
+            note = `first build failed (${firstError}); cleaned + retried. `
+          }
+        }
+        steps.push({
+          name: 'pnpm run build',
+          ok: rep.exitCode === 0,
+          exitCode: rep.exitCode,
+          detail: note + rep.delta.slice(-3000),
+          spillPath: rep.spillPath,
+        })
+        if (rep.exitCode !== 0) {
+          return { ok: false, summary: `pnpm run build failed${note ? ' (retry after clean also failed)' : ''}: ${rep.delta.slice(-1000)}`, repo, beforeHead, afterHead, steps }
         }
       }
       if (needTest) {

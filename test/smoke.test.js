@@ -1,8 +1,9 @@
 /**
  * dsh-selfup smoke tests: apply the plugin against a stub context and assert
  * the four tools register with the expected names and well-formed JSON schemas.
- * No harness is required — the plugin's shell usage is exercised only at tool
- * execution time, which these tests do not trigger.
+ * No harness is required — the registration tests never invoke a tool's
+ * execute path; the build-failure tests below drive shell.start/run with
+ * scripted responses to exercise dsh_update's clean-and-retry fallback.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -24,6 +25,16 @@ function stubContext() {
       run: async () => ({ exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }),
     },
     _tools: tools,
+  }
+}
+
+/** A background-process value shaped like what waitProc consumes. */
+function makeProc(exitCode, delta = '') {
+  return {
+    done: Promise.resolve(),
+    exitCode,
+    signal: null,
+    readOutput: () => ({ delta, lossy: false, stdoutSpillPath: '', stderrSpillPath: '' }),
   }
 }
 
@@ -68,4 +79,63 @@ test('dsh_install offers local and arch modes', () => {
   apply(ctx)
   const install = ctx._tools.find((tool) => tool.name === 'dsh_install')
   assert.deepEqual(install.parameters.properties.mode.enum, ['local', 'arch'])
+})
+
+test('dsh_update cleans and retries the build after a stale-artifact failure', async () => {
+  let buildAttempts = 0
+  let cleaned = false
+  const ctx = stubContext()
+  ctx.shell.start = (spec) => {
+    if (spec.command === 'pnpm run build') {
+      buildAttempts += 1
+      return buildAttempts === 1
+        ? makeProc(1, 'MISSING_EXPORT "FIRST_PARTY_SECTION_ORDER" is not exported')
+        : makeProc(0, 'build ok')
+    }
+    return makeProc(0, '')
+  }
+  ctx.shell.run = async (spec) => {
+    if (spec.command === 'pnpm run clean') {
+      cleaned = true
+      return { exitCode: 0, stdout: { text: 'clean: removed 267 paths' }, stderr: { text: '' } }
+    }
+    return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }
+  }
+  apply(ctx)
+  const update = ctx._tools.find((tool) => tool.name === 'dsh_update')
+  const result = await update.execute({}, {})
+  assert.equal(result.ok, true)
+  assert.equal(cleaned, true)
+  assert.equal(buildAttempts, 2)
+  const build = result.steps.find((s) => s.name === 'pnpm run build')
+  assert.equal(build.ok, true)
+  assert.ok(build.detail.startsWith('first build failed'))
+  assert.ok(result.steps.some((s) => s.name === 'pnpm run clean' && s.ok))
+})
+
+test('dsh_update does not clean when the build succeeds on the first attempt', async () => {
+  let buildAttempts = 0
+  let cleaned = false
+  const ctx = stubContext()
+  ctx.shell.start = (spec) => {
+    if (spec.command === 'pnpm run build') {
+      buildAttempts += 1
+      return makeProc(0, 'build ok')
+    }
+    return makeProc(0, '')
+  }
+  ctx.shell.run = async (spec) => {
+    if (spec.command === 'pnpm run clean') {
+      cleaned = true
+      return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }
+    }
+    return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }
+  }
+  apply(ctx)
+  const update = ctx._tools.find((tool) => tool.name === 'dsh_update')
+  const result = await update.execute({}, {})
+  assert.equal(result.ok, true)
+  assert.equal(cleaned, false)
+  assert.equal(buildAttempts, 1)
+  assert.equal(result.steps.some((s) => s.name === 'pnpm run clean'), false)
 })

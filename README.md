@@ -67,6 +67,7 @@ Parameters (all optional booleans, default `true`): `pull`, `install`, `build`, 
 - A dirty working tree refuses the pull **unless** `force=true`, which auto-stashes before the pull and pops after (a pop conflict is reported, not hidden).
 - When the tree is already at `origin/master` and nothing else is requested, the tool says so and stops.
 - Each step returns its exit code and an output tail; long `pnpm` steps run as background processes with the call's abort signal forwarded, so a cancelled call kills the step.
+- If `pnpm run build` fails (commonly a stale-`lib/` `MISSING_EXPORT` after a pull renames or removes a package), the tool runs `pnpm run clean` and retries the build once; a genuinely broken build is still reported as a failure.
 - The running web session keeps its loaded code — restart the service to apply: `dsh_systemd action=restart`.
 
 ### `dsh_install`
