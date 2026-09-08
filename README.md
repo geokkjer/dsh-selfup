@@ -62,13 +62,13 @@ Update the checkout in four independently skippable steps:
 3. `pnpm install`
 4. `pnpm run build` (and optionally `pnpm run test`)
 
-Parameters (all optional booleans, default `true`): `pull`, `install`, `build`, `test`, `force`.
+Parameters (all optional booleans): `pull`, `install`, `build`, `restart` default to `true`; `test`, `force` default to `false`.
 
 - A dirty working tree refuses the pull **unless** `force=true`, which auto-stashes before the pull and pops after (a pop conflict is reported, not hidden).
 - When the tree is already at `origin/master` and nothing else is requested, the tool says so and stops.
 - Each step returns its exit code and an output tail; long `pnpm` steps run as background processes with the call's abort signal forwarded, so a cancelled call kills the step.
 - If `pnpm run build` fails (commonly a stale-`lib/` `MISSING_EXPORT` after a pull renames or removes a package), the tool runs `pnpm run clean` and retries the build once; a genuinely broken build is still reported as a failure.
-- The running web session keeps its loaded code — restart the service to apply: `dsh_systemd action=restart`.
+- After a successful build of new commits the tool restarts the `dsh-web` service a few seconds later (via a transient `systemd-run` timer) so the new code loads and the stale-web-view plugin error clears; pass `restart=false` to defer. The restart terminates the calling session.
 
 ### `dsh_install`
 

@@ -215,7 +215,7 @@ export function apply(ctx) {
 
   ctx.tools.register(toolDefinition({
     name: 'dsh_update',
-    description: 'Update the DeepSeek Harness checkout: git fetch + fast-forward pull, pnpm install, and a full build (pnpm run build), each as its own step. Refuses a dirty working tree unless force=true (auto-stash before the pull, pop after). Returns per-step exit codes and output tails. A build that fails on stale lib/ artifacts is retried once after pnpm run clean. The running web session keeps its loaded code until the dsh-web service is restarted (dsh_systemd action=restart).',
+    description: 'Update the DeepSeek Harness checkout: git fetch + fast-forward pull, pnpm install, and a full build (pnpm run build), each as its own step. Refuses a dirty working tree unless force=true (auto-stash before the pull, pop after). Returns per-step exit codes and output tails. A build that fails on stale lib/ artifacts is retried once after pnpm run clean. After a successful build of new commits the dsh-web service is restarted to load them (pass restart=false to defer; the restart ends the calling session).',
     parameters: {
       type: 'object',
       properties: {
@@ -224,6 +224,7 @@ export function apply(ctx) {
         build: { type: 'boolean', description: 'Run pnpm run build after install (default true).' },
         test: { type: 'boolean', description: 'Also run pnpm run test after the build (default false; slow).' },
         force: { type: 'boolean', description: 'Proceed with a dirty working tree by auto-stashing before the pull and popping after (default false).' },
+        restart: { type: 'boolean', description: 'Restart the dsh-web service after a successful build of new commits so they load (default true; ends the calling session).' },
       },
       additionalProperties: false,
     },
@@ -251,6 +252,7 @@ export function apply(ctx) {
             },
           },
         },
+        restartScheduled: { type: 'boolean' },
       },
       required: ['ok', 'summary'],
     },
@@ -371,14 +373,31 @@ export function apply(ctx) {
       const logR = await runCmd(`git -C ${repo} log --oneline ${beforeHead}..${afterHead}`, { timeoutMs: 15000, policy })
       const commits = logR.exitCode === 0 ? logR.stdout.text.split('\n').filter(Boolean) : []
       const ok = steps.length > 0 && steps.every((s) => s.ok)
+      const changed = commits.length > 0
+      const wantRestart = args.restart !== false
+      let restartScheduled = false
+      if (wantRestart && ok && needBuild && changed) {
+        // The running web service loads its code at startup, so the new build
+        // only takes effect on restart, and a stale-web-view plugin error
+        // persists until it does. Schedule the restart a few seconds out so
+        // this call returns its result before the session is terminated.
+        const rr = await runCmd('systemd-run --user --on-active=5 -- systemctl --user restart dsh-web', { timeoutMs: 60000, policy })
+        restartScheduled = rr.exitCode === 0
+      }
+      const restartNote = restartScheduled
+        ? 'Restart scheduled; the web service is reloading the new code.'
+        : changed && needBuild
+          ? 'Restart the web service to apply the new code (dsh_systemd action=restart).'
+          : ''
       return {
         ok,
-        summary: `update ${ok ? 'succeeded' : 'finished with failures'}: ${beforeHead} -> ${afterHead} (${commits.length} new commit(s)). Restart the web service to apply the new code: dsh_systemd action=restart.`,
+        summary: `update ${ok ? 'succeeded' : 'finished with failures'}: ${beforeHead} -> ${afterHead} (${commits.length} new commit(s)).${restartNote ? ` ${restartNote}` : ''}`,
         repo,
         beforeHead,
         afterHead,
         commits,
         steps,
+        restartScheduled,
       }
     },
   }))

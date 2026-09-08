@@ -139,3 +139,42 @@ test('dsh_update does not clean when the build succeeds on the first attempt', a
   assert.equal(buildAttempts, 1)
   assert.equal(result.steps.some((s) => s.name === 'pnpm run clean'), false)
 })
+
+test('dsh_update schedules a web-service restart after building new commits', async () => {
+  let restartCalls = 0
+  const ctx = stubContext()
+  ctx.shell.start = (spec) => {
+    if (spec.command === 'pnpm run build') return makeProc(0, 'build ok')
+    return makeProc(0, '')
+  }
+  ctx.shell.run = async (spec) => {
+    const cmd = spec.command
+    if (cmd.includes('log --oneline')) return { exitCode: 0, stdout: { text: 'a1b2c3 new code' }, stderr: { text: '' } }
+    if (cmd.includes('systemd-run')) { restartCalls += 1; return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } } }
+    return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }
+  }
+  apply(ctx)
+  const update = ctx._tools.find((tool) => tool.name === 'dsh_update')
+  const result = await update.execute({}, {})
+  assert.equal(result.ok, true)
+  assert.equal(result.restartScheduled, true)
+  assert.equal(restartCalls, 1)
+})
+
+test('dsh_update skips the restart when restart=false', async () => {
+  let restartCalls = 0
+  const ctx = stubContext()
+  ctx.shell.start = (spec) => makeProc(0, 'build ok')
+  ctx.shell.run = async (spec) => {
+    const cmd = spec.command
+    if (cmd.includes('log --oneline')) return { exitCode: 0, stdout: { text: 'a1b2c3 new code' }, stderr: { text: '' } }
+    if (cmd.includes('systemd-run')) { restartCalls += 1; return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } } }
+    return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }
+  }
+  apply(ctx)
+  const update = ctx._tools.find((tool) => tool.name === 'dsh_update')
+  const result = await update.execute({ restart: false }, {})
+  assert.equal(result.ok, true)
+  assert.equal(result.restartScheduled, false)
+  assert.equal(restartCalls, 0)
+})
