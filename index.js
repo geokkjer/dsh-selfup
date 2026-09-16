@@ -6,7 +6,7 @@
  * dependencies: it talks to the repo through the `shell` service the harness
  * already mounts, so this package imports nothing at runtime.
  *
- *   dsh_update_status — read-only state of the checkout, launcher, and service
+ *   dsh_update_status — checkout, launcher, and service state (fetches origin first)
  *   dsh_update        — git fetch + fast-forward pull, pnpm install, pnpm run build
  *   dsh_install       — install `dsh` to ~/.local/bin (mode=local) or build an Arch
  *                       package (mode=arch) from the published npm tarball
@@ -124,12 +124,35 @@ export function apply(ctx) {
     return m ? m[1] : ''
   }
 
+  /**
+   * Split `git status --porcelain` output into tracked changes and untracked
+   * paths. Untracked files do not block a fast-forward, so only the tracked
+   * set justifies refusing an update or moving work into a stash.
+   * @param lines - non-empty porcelain status lines.
+   * @returns `tracked` change lines and `untracked` (`??`) path lines.
+   */
+  const partitionStatus = (lines) => {
+    const tracked = []
+    const untracked = []
+    for (const line of lines) {
+      if (line.startsWith('??')) untracked.push(line)
+      else tracked.push(line)
+    }
+    return { tracked, untracked }
+  }
+
   // ── dsh_update_status ────────────────────────────────────────────────────────
 
   ctx.tools.register(toolDefinition({
     name: 'dsh_update_status',
-    description: 'Read-only status of the DeepSeek Harness checkout and services: repo path, branch, HEAD, ahead/behind origin/master, dirty files, CLI version, built-bin presence, ~/.local/bin/dsh launcher, and the dsh-web systemd user service state.',
-    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    description: 'Status of the DeepSeek Harness checkout and services: repo path, branch, HEAD, ahead/behind origin/master, tracked and untracked files, CLI version, built-bin presence, ~/.local/bin/dsh launcher, and the dsh-web systemd user service state. Fetches origin first so the ahead/behind count reflects the real remote rather than the last fetch (pass fetch=false to stay offline and read local refs).',
+    parameters: {
+      type: 'object',
+      properties: {
+        fetch: { type: 'boolean', description: 'Fetch origin before comparing, so ahead/behind is current (default true; pass false to read local refs only).' },
+      },
+      additionalProperties: false,
+    },
     schema: {
       type: 'object',
       additionalProperties: true,
@@ -141,8 +164,11 @@ export function apply(ctx) {
         head: { type: 'string' },
         behind: { type: 'integer' },
         ahead: { type: 'integer' },
+        fetched: { type: 'boolean' },
         dirtyCount: { type: 'integer' },
         dirtyFiles: { type: 'array', items: { type: 'string' } },
+        untrackedCount: { type: 'integer' },
+        untrackedFiles: { type: 'array', items: { type: 'string' } },
         version: { type: 'string' },
         binBuilt: { type: 'boolean' },
         launcherInstalled: { type: 'boolean' },
@@ -153,10 +179,20 @@ export function apply(ctx) {
       },
       required: ['ok', 'summary'],
     },
-    async execute(_args, exec) {
+    async execute(args, exec) {
       const policy = resolvePolicy(ctx, exec)
       const repo = await repoRoot({ policy })
       const home = await homeDir({ policy })
+      const wantFetch = args.fetch !== false
+      let fetched = false
+      let fetchNote = wantFetch ? '' : ' (local refs; fetch=false)'
+      if (wantFetch) {
+        // The count below compares against origin/master, which only advances on
+        // a fetch: without one it reports "0 behind" for arbitrarily stale refs.
+        const fetchR = await runCmd(`git -C ${repo} fetch origin`, { timeoutMs: 300000, policy })
+        fetched = fetchR.exitCode === 0
+        if (!fetched) fetchNote = ` (fetch failed: ${shortSummary(fetchR).slice(-200)})`
+      }
       const branchR = await runCmd(`git -C ${repo} symbolic-ref --short HEAD`, { timeoutMs: 15000, policy })
       const branch = branchR.exitCode === 0 ? branchR.stdout.text.trim() : 'unknown'
       const headR = await runCmd(`git -C ${repo} log -1 --format='%h %s'`, { timeoutMs: 15000, policy })
@@ -170,7 +206,8 @@ export function apply(ctx) {
         ahead = Number(parts[1] || 0)
       }
       const dirtyR = await runCmd(`git -C ${repo} status --porcelain`, { timeoutMs: 15000, policy })
-      const dirty = dirtyR.exitCode === 0 ? dirtyR.stdout.text.split('\n').filter(Boolean) : []
+      const statusLines = dirtyR.exitCode === 0 ? dirtyR.stdout.text.split('\n').filter(Boolean) : []
+      const { tracked, untracked } = partitionStatus(statusLines)
       const version = await versionFromManifest(repo, { policy })
       const binR = await runCmd(`test -x ${repo}/apps/cli/lib/bin.js && echo yes || echo no`, { timeoutMs: 15000, policy })
       const launcherR = await runCmd(`test -x ${home}/.local/bin/dsh && echo yes || echo no`, { timeoutMs: 15000, policy })
@@ -183,8 +220,8 @@ export function apply(ctx) {
       const summary = [
         `repo: ${repo}`,
         `branch: ${branch} @ ${head}`,
-        `origin/master: ${behind} behind, ${ahead} ahead`,
-        `dirty: ${dirty.length} file(s)`,
+        `origin/master: ${behind} behind, ${ahead} ahead${fetchNote}`,
+        `dirty: ${tracked.length} tracked, ${untracked.length} untracked`,
         `cli version: ${version || '?'}`,
         `built bin: ${binBuilt ? 'present' : 'missing (run dsh_update to build)'}`,
         `launcher: ${launcherInstalled ? `${home}/.local/bin/dsh` : 'not installed (dsh_install mode=local)'}`,
@@ -198,8 +235,11 @@ export function apply(ctx) {
         head,
         behind,
         ahead,
-        dirtyCount: dirty.length,
-        dirtyFiles: dirty.slice(0, 20),
+        fetched,
+        dirtyCount: tracked.length,
+        dirtyFiles: tracked.slice(0, 20),
+        untrackedCount: untracked.length,
+        untrackedFiles: untracked.slice(0, 20),
         version,
         binBuilt,
         launcherInstalled,
@@ -215,7 +255,7 @@ export function apply(ctx) {
 
   ctx.tools.register(toolDefinition({
     name: 'dsh_update',
-    description: 'Update the DeepSeek Harness checkout: git fetch + fast-forward pull, pnpm install, and a full build (pnpm run build), each as its own step. Refuses a dirty working tree unless force=true (auto-stash before the pull, pop after). Returns per-step exit codes and output tails. A build that fails on stale lib/ artifacts is retried once after pnpm run clean. After a successful build of new commits the dsh-web service is restarted to load them (pass restart=false to defer; the restart ends the calling session).',
+    description: 'Update the DeepSeek Harness checkout: git fetch + fast-forward pull, pnpm install, and a full build (pnpm run build), each as its own step. Refuses uncommitted tracked changes unless force=true (auto-stash before the pull, pop after); untracked files never block and are never stashed. Returns per-step exit codes and output tails. A build that fails on stale lib/ artifacts is retried once after pnpm run clean. After a successful build of new commits the dsh-web service is restarted to load them (pass restart=false to defer; the restart ends the calling session).',
     parameters: {
       type: 'object',
       properties: {
@@ -223,7 +263,7 @@ export function apply(ctx) {
         install: { type: 'boolean', description: 'Run pnpm install after the pull (default true).' },
         build: { type: 'boolean', description: 'Run pnpm run build after install (default true).' },
         test: { type: 'boolean', description: 'Also run pnpm run test after the build (default false; slow).' },
-        force: { type: 'boolean', description: 'Proceed with a dirty working tree by auto-stashing before the pull and popping after (default false).' },
+        force: { type: 'boolean', description: 'Proceed despite uncommitted tracked changes by auto-stashing them before the pull and popping after (default false; untracked files are never stashed).' },
         restart: { type: 'boolean', description: 'Restart the dsh-web service after a successful build of new commits so they load (default true; ends the calling session).' },
       },
       additionalProperties: false,
@@ -290,18 +330,21 @@ export function apply(ctx) {
           steps.push({ name: 'git pull (ff-only)', ok: true, exitCode: 0, detail: 'already up to date' })
         } else {
           const dirtyR = await runCmd(`git -C ${repo} status --porcelain`, { timeoutMs: 15000, policy })
-          const dirtyList = dirtyR.exitCode === 0 ? dirtyR.stdout.text.split('\n').filter(Boolean) : []
-          if (dirtyList.length > 0 && !force) {
+          const statusLines = dirtyR.exitCode === 0 ? dirtyR.stdout.text.split('\n').filter(Boolean) : []
+          const { tracked } = partitionStatus(statusLines)
+          if (tracked.length > 0 && !force) {
             return {
               ok: false,
-              summary: `working tree dirty (${dirtyList.length} file(s)); commit, clean, or run with force=true to auto-stash. First: ${dirtyList.slice(0, 5).join('; ')}`,
+              summary: `working tree has ${tracked.length} tracked change(s); commit or run with force=true to auto-stash. First: ${tracked.slice(0, 5).join('; ')}`,
               repo,
               beforeHead,
               steps,
             }
           }
-          if (dirtyList.length > 0) {
-            const stash = await runCmd(`git -C ${repo} stash push -u -m dsh-selfup`, { timeoutMs: 60000, policy })
+          if (tracked.length > 0) {
+            // Tracked changes only: untracked paths do not block a fast-forward,
+            // and `-u` would sweep unrelated work into the stash.
+            const stash = await runCmd(`git -C ${repo} stash push -m dsh-selfup`, { timeoutMs: 60000, policy })
             stashed = stash.exitCode === 0
             steps.push({ name: 'git stash', ok: stashed, exitCode: stash.exitCode === null ? -1 : stash.exitCode, detail: shortSummary(stash) })
           }

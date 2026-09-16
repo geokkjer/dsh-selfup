@@ -6,7 +6,7 @@ Self-update and deployment tools for [DeepSeek Harness](https://github.com/deeps
 
 | Tool | What it does |
 |---|---|
-| [`dsh_update_status`](#dsh_update_status) | Read-only: repo, branch, HEAD, ahead/behind, dirty files, CLI version, built-bin freshness, launcher and systemd-unit state |
+| [`dsh_update_status`](#dsh_update_status) | Repo, branch, HEAD, ahead/behind (fetches first), tracked and untracked files, CLI version, built-bin freshness, launcher and systemd-unit state |
 | [`dsh_update`](#dsh_update) | `git fetch` → fast-forward pull → `pnpm install` → `pnpm run build` (optional `pnpm run test`), each as its own reported step |
 | [`dsh_install`](#dsh_install) | Install `dsh` to `~/.local/bin` (`mode=local`, from the repo) or build an Arch package from the published npm tarball (`mode=arch`) |
 | [`dsh_systemd`](#dsh_systemd) | Manage a systemd **user** service running `dsh web` (`~/.config/systemd/user/dsh-web.service`) |
@@ -43,15 +43,17 @@ To develop against this repo without a build step, the package entry is plain ES
 
 ### `dsh_update_status`
 
-Read-only snapshot of the checkout and its deployment:
+Snapshot of the checkout and its deployment:
 
 - repo path, branch, HEAD
 - commits behind / ahead of `origin/master`
-- dirty working-tree file count (first 20 names)
+- tracked changes and untracked paths, counted and listed separately (first 20 of each)
 - CLI version from `apps/cli/package.json`
 - built-bin presence (`apps/cli/lib/bin.js`)
 - `~/.local/bin/dsh` launcher presence
 - `dsh-web` systemd unit: active, enabled, file present
+
+The ahead/behind count compares against `origin/master`, which only moves on a fetch, so the tool runs `git fetch origin` first — otherwise a checkout hundreds of commits behind still reports `0 behind`. Pass `fetch=false` to stay offline; the summary then discloses `fetch=false`, and a failed fetch is reported rather than presented as up-to-date.
 
 ### `dsh_update`
 
@@ -64,7 +66,8 @@ Update the checkout in four independently skippable steps:
 
 Parameters (all optional booleans): `pull`, `install`, `build`, `restart` default to `true`; `test`, `force` default to `false`.
 
-- A dirty working tree refuses the pull **unless** `force=true`, which auto-stashes before the pull and pops after (a pop conflict is reported, not hidden).
+- Uncommitted **tracked** changes refuse the pull **unless** `force=true`, which auto-stashes them before the pull and pops after (a pop conflict is reported, not hidden). The stash never includes untracked files.
+- **Untracked** files never block the pull, so unrelated work in the checkout — a scratch directory, research notes — stays where it is instead of being swept into a stash. If the fast-forward genuinely collides with an untracked path, `git merge --ff-only` fails and the tool reports it.
 - When the tree is already at `origin/master` and nothing else is requested, the tool says so and stops.
 - Each step returns its exit code and an output tail; long `pnpm` steps run as background processes with the call's abort signal forwarded, so a cancelled call kills the step.
 - If `pnpm run build` fails (commonly a stale-`lib/` `MISSING_EXPORT` after a pull renames or removes a package), the tool runs `pnpm run clean` and retries the build once; a genuinely broken build is still reported as a failure.
