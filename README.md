@@ -11,7 +11,7 @@ Self-update and deployment tools for [DeepSeek Harness](https://github.com/deeps
 | [`dsh_install`](#dsh_install) | Install `dsh` to `~/.local/bin` (`mode=local`, from the repo) or build an Arch package from the published npm tarball (`mode=arch`) |
 | [`dsh_systemd`](#dsh_systemd) | Manage a systemd **user** service running `dsh web` (`~/.config/systemd/user/dsh-web.service`) |
 
-Zero runtime dependencies: the plugin talks to the checkout through the harness's own `shell` service, and `ctx.tools.register()` accepts the raw definitions directly.
+Zero runtime dependencies: the plugin talks to the checkout through the harness's own `shell` service, and `ctx.tools.register()` accepts the raw definitions directly. (Node builtins only — `node:fs`, `node:os` — for the writable-root check.)
 
 ## Requirements
 
@@ -53,7 +53,7 @@ Snapshot of the checkout and its deployment:
 - `~/.local/bin/dsh` launcher presence
 - `dsh-web` systemd unit: active, enabled, file present
 
-The ahead/behind count compares against `origin/master`, which only moves on a fetch, so the tool runs `git fetch origin` first — otherwise a checkout hundreds of commits behind still reports `0 behind`. Pass `fetch=false` to stay offline; the summary then discloses `fetch=false`, and a failed fetch is reported rather than presented as up-to-date.
+The ahead/behind count compares against `origin/master`, which only moves on a fetch, so the tool runs `git fetch origin` first — otherwise a checkout hundreds of commits behind still reports `0 behind`. Pass `fetch=false` to stay offline; the summary then discloses `fetch=false`, and a failed fetch is reported rather than presented as up-to-date. When the session file policy cannot write the checkout, the fetch is **skipped and disclosed** rather than reported as a failure (see [Sandbox policy](#sandbox-policy)).
 
 ### `dsh_update`
 
@@ -64,7 +64,7 @@ Update the checkout in four independently skippable steps:
 3. `pnpm install`
 4. `pnpm run build` (and optionally `pnpm run test`)
 
-Parameters (all optional booleans): `pull`, `install`, `build`, `restart` default to `true`; `test`, `force` default to `false`.
+Parameters (all optional booleans): `pull`, `install`, `build`, `restart` default to `true`; `test`, `force`, `full_access` default to `false`.
 
 - Uncommitted **tracked** changes refuse the pull **unless** `force=true`, which auto-stashes them before the pull and pops after (a pop conflict is reported, not hidden). The stash never includes untracked files.
 - **Untracked** files never block the pull, so unrelated work in the checkout — a scratch directory, research notes — stays where it is instead of being swept into a stash. If the fast-forward genuinely collides with an untracked path, `git merge --ff-only` fails and the tool reports it.
@@ -91,7 +91,23 @@ The unit sets `WorkingDirectory` to the repo, `DSH_HOME` to `$HOME/.dsh`, and `P
 
 ## Sandbox policy
 
-The plugin resolves the session's sandbox policy (`sandboxPolicy.resolve({ session })`) and passes it to every shell call, so writes outside the workspace — the launcher, the unit file, the Arch build dir — inherit the session's approved mode instead of the executor's confining default.
+The plugin resolves the session's sandbox policy (`sandboxPolicy.resolve({ session })`) and passes it to every shell call, so writes outside the workspace — the launcher, the unit file, the Arch build dir, the checkout itself — inherit the session's approved mode instead of the executor's confining default.
+
+Because those paths usually lie **outside** the session workspace, each writing tool checks the resolved policy before it touches anything:
+
+- **Contained** (`danger-full-access`, or a `workspace-write` root that covers the target) — the tool runs under the session policy, unchanged.
+- **Confined** — the tool refuses up front and reports what was blocked, under which policy, and the levers that resolve it. A confined checkout therefore produces a clear refusal, not an opaque `Read-only file system` from the middle of a pull.
+- **`full_access: true`** — the explicit lever: that one call runs with `danger-full-access`, bypassing the session file policy. **Only pass it with the user's explicit consent**, and the result reports `sandbox.escalated: true`, so the bypass is visible in the transcript. This is the lever that works where approval prompts are disabled.
+- **Approval route** — without `full_access`, the tool asks the harness approval channel exactly as `tool-bash`/`tool-fs` do (`ctx.approval.request`, same reason shape) and widens only on `allowed-once`. No channel, no agent, a rejection, or a cancellation all mean *refused*, reported with the outcome — never a silent bypass.
+
+Which paths each tool gates, and when:
+
+| Tool | Gated path | Notes |
+|---|---|---|
+| `dsh_update` | the checkout (`git rev-parse --show-toplevel`) | the whole call is gated before the first step |
+| `dsh_update_status` | the checkout | only the fetch writes, so a confined policy skips and discloses it instead of failing the status read |
+| `dsh_install` | `~/.local/bin/dsh` (local) or `~/.cache/dsh-arch` (arch) | |
+| `dsh_systemd` | `~/.config/systemd/user/dsh-web.service` | only `action=install` writes a file; `status`/`start`/`stop`/… talk to the user manager and stay available under a read-only policy |
 
 ## Tests
 
@@ -99,7 +115,7 @@ The plugin resolves the session's sandbox policy (`sandboxPolicy.resolve({ sessi
 npm test
 ```
 
-Applies the plugin against a stub context and asserts the four tools register with the expected names and well-formed JSON schemas (no harness needed).
+Applies the plugin against a stub context and asserts the four tools register with the expected names and well-formed JSON schemas, then drives the scripted `shell` seam to exercise `dsh_update`'s clean-and-retry fallback, its restart scheduling, the tracked/untracked stash rules, and the sandbox-policy gate (refusal, `full_access`, and the approval route). No harness is required.
 
 ## License
 

@@ -319,3 +319,133 @@ test('dsh_update force stashes tracked changes without sweeping untracked files'
   assert.equal(stashes[0].includes(' -u'), false, 'untracked files must never be stashed')
   assert.equal(stashes[0].includes('--include-untracked'), false)
 })
+
+// ── sandbox-policy gating ───────────────────────────────────────────────────
+//
+// The maintenance tools write outside a session workspace (the checkout, the
+// launcher, the unit file), so a confining file policy must not surface as an
+// opaque read-only failure from inside a step. These drive the gate that
+// refuses up front, the explicit `full_access` lever, and the approval route.
+
+/** The session cwd these tests use — deliberately not the checkout. */
+const SESSION_CWD = '/home/geir/Projects/sound-arranger'
+/** The checkout `git rev-parse --show-toplevel` resolves to here. */
+const REPO = '/home/geir/Projects/deepseek-harness'
+/** A calling agent, which the approval route needs to have anywhere to route. */
+const AGENT = { session: { id: 'session-1', header: { cwd: SESSION_CWD } } }
+
+/** A resolved policy shaped like the harness's, confining the checkout by default. */
+function confinedPolicy(workspaceRoot = SESSION_CWD) {
+  return { mode: 'workspace-write', workspaceRoot }
+}
+
+/**
+ * A stub whose `sandboxPolicy` resolves to `policy`, whose `approval` (when an
+ * `outcome` is given) answers with it, and which records every resolved shell
+ * spec so a test can assert which policy each command actually ran under.
+ * @param options - the policy, an optional approval outcome, and command answers.
+ * @returns the stub context, with `_specs` and `_asks` recorded.
+ */
+function policyContext({ policy, outcome, run } = {}) {
+  const ctx = stubContext()
+  const specs = []
+  const asks = []
+  ctx.get = (key) => {
+    if (key === 'sandboxPolicy') return { resolve: () => policy }
+    if (key === 'approval') {
+      return outcome === undefined
+        ? undefined
+        : { request: async (req) => { asks.push(req); return outcome } }
+    }
+    return undefined
+  }
+  const baseResolve = ctx.shell.resolve
+  ctx.shell.resolve = (request) => { specs.push(request); return baseResolve(request) }
+  ctx.shell.run = run ?? (async (spec) => (spec.command.includes('rev-parse --show-toplevel') ? okText(REPO) : okText('')))
+  ctx.shell.start = () => makeProc(0, 'build ok')
+  ctx._specs = specs
+  ctx._asks = asks
+  return ctx
+}
+
+/** The registered tool with `toolName`. */
+function toolOf(ctx, toolName) {
+  return ctx._tools.find((tool) => tool.name === toolName)
+}
+
+test('every maintenance tool advertises the full_access lever', () => {
+  const ctx = stubContext()
+  apply(ctx)
+  for (const toolName of ['dsh_update', 'dsh_update_status', 'dsh_install', 'dsh_systemd']) {
+    assert.equal(toolOf(ctx, toolName).parameters.properties.full_access.type, 'boolean', `${toolName} must advertise full_access`)
+  }
+})
+
+test('dsh_update refuses a checkout outside a confining policy without running a step', async () => {
+  const ctx = policyContext({ policy: confinedPolicy() })
+  apply(ctx)
+  const result = await toolOf(ctx, 'dsh_update').execute({}, {})
+  assert.equal(result.ok, false)
+  assert.match(result.summary, /did not run/)
+  assert.match(result.summary, /full_access=true/)
+  assert.equal(result.sandbox.escalation, 'unavailable')
+  assert.deepEqual(result.sandbox.blocked, [REPO])
+  const commands = ctx._specs.map((spec) => spec.command)
+  assert.equal(commands.some((cmd) => /fetch origin|merge --ff-only|pnpm/.test(cmd)), false, 'no step may run')
+})
+
+test('dsh_update full_access=true widens the policy for the whole call and reports it', async () => {
+  const ctx = policyContext({ policy: confinedPolicy() })
+  apply(ctx)
+  const result = await toolOf(ctx, 'dsh_update').execute({ full_access: true, restart: false }, {})
+  assert.equal(result.ok, true)
+  assert.equal(result.sandbox.mode, 'danger-full-access')
+  assert.equal(result.sandbox.escalated, true)
+  assert.equal(result.sandbox.via, 'full_access=true')
+  const fetch = ctx._specs.find((spec) => spec.command.includes('fetch origin'))
+  assert.equal(fetch.sandboxPolicy.mode, 'danger-full-access', 'the fetch must run under the widened policy')
+})
+
+test('dsh_update escalates through the approval channel when the user allows it once', async () => {
+  const ctx = policyContext({ policy: confinedPolicy(), outcome: 'allowed-once' })
+  apply(ctx)
+  const result = await toolOf(ctx, 'dsh_update').execute({ restart: false }, { agent: AGENT, callId: 'call-1' })
+  assert.equal(result.ok, true)
+  assert.equal(result.sandbox.via, 'approval')
+  assert.equal(ctx._asks.length, 1)
+  assert.match(ctx._asks[0].reason, /escalate sandbox to danger-full-access/)
+  assert.equal(ctx._asks[0].toolName, 'dsh_update')
+  assert.equal(ctx._asks[0].callId, 'call-1')
+})
+
+test('dsh_update reports a rejected escalation instead of widening', async () => {
+  const ctx = policyContext({ policy: confinedPolicy(), outcome: 'rejected' })
+  apply(ctx)
+  const result = await toolOf(ctx, 'dsh_update').execute({}, { agent: AGENT, callId: 'call-1' })
+  assert.equal(result.ok, false)
+  assert.equal(result.sandbox.escalation, 'rejected')
+  assert.match(result.summary, /approval request was rejected/)
+})
+
+test('dsh_update does not escalate when the workspace already contains the checkout', async () => {
+  const ctx = policyContext({ policy: confinedPolicy('/home/geir/Projects') })
+  apply(ctx)
+  const result = await toolOf(ctx, 'dsh_update').execute({ restart: false }, {})
+  assert.equal(result.ok, true)
+  assert.equal(result.sandbox, undefined, 'no escalation field without one')
+  const fetch = ctx._specs.find((spec) => spec.command.includes('fetch origin'))
+  assert.equal(fetch.sandboxPolicy.mode, 'workspace-write')
+})
+
+test('dsh_update_status skips and discloses a fetch the confining policy cannot make', async () => {
+  const ctx = policyContext({ policy: confinedPolicy() })
+  const status = statusContext({ count: '12\t0' })
+  ctx.shell.run = status.shell.run
+  apply(ctx)
+  const result = await toolOf(ctx, 'dsh_update_status').execute({}, {})
+  assert.equal(result.ok, true)
+  assert.equal(result.fetched, false)
+  assert.match(result.summary, /fetch skipped/)
+  assert.match(result.summary, /full_access=true/)
+  assert.equal(ctx._specs.some((spec) => spec.command.includes('fetch origin')), false)
+})
